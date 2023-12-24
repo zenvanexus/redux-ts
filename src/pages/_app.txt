@@ -1,0 +1,448 @@
+import RootLayout from "@/components/RootLayout";
+import AppThemeProvider from "@/lib/providers/AppThemeProvider";
+import { actionTypes } from "@/lib/redux/legacyStore/action.types";
+import { useAppDispatch, useAppSelector } from "@/lib/redux/legacyStore/hooks";
+import { legacyWrapper } from "@/lib/redux/legacyStore/legacy.store";
+import { newStore, newStoreWrapper } from "@/lib/redux/newStore";
+import { styles } from "@/styles/theme";
+import type { AppProps } from "next/app";
+import React from "react";
+import { Provider } from "react-redux";
+import subscribeMeshSyncEvents from "@/components/graphql/subscriptions/MeshSyncEventsSubscription";
+import subscribeK8sContext from "@/components/graphql/subscriptions/K8sContextSubscription";
+import { updateURLs } from "@/utils/utils";
+import {
+  setConnectionMetadata,
+  updateTelemetryUrls,
+} from "@/lib/redux/legacyStore/action.creators";
+import { isTelemetryComponent, TelemetryComps } from "@/utils/nameMapper";
+import { GQLSubscription } from "@/components/Subscription/GQLSubscription";
+import { MESHERY_CONTROLLER_SUBSCRIPTION } from "@/components/Subscription/helpers";
+import { CONNECTION_KINDS } from "@/utils/Enum";
+import { useRouter } from "next/navigation";
+import _ from "lodash";
+import { getK8sConfigIdsFromK8sConfig } from "@/utils/multi-ctx";
+import { CapabilitiesRegistry } from "@/utils/capabilitiesRegistry";
+import dataFetch, { promisifiedDataFetch } from "@/utils/dataFetch";
+import { getMeshModelComponent } from "@/utils/meshmodel";
+import { extractURLFromScanData } from "@/components/ConnectionWizard/helpers/metrics";
+import { RelayEnvironmentProvider } from "react-relay";
+import { createRelayEnvironment } from "@/lib/relay/RelayEnvironment";
+
+interface K8sContextResult {
+  k8sContext: {
+    contexts: string[];
+  };
+}
+
+export function App({ Component, pageProps, ...rest }: AppProps) {
+  const classes = styles();
+
+  const { store, props } = legacyWrapper.useWrappedStore(rest);
+
+  // Log the state changes
+  console.log("Legacy state after dispatch:", store.getState());
+
+  const dispatch = useAppDispatch();
+
+  const isDrawerCollapsed = useAppSelector((state) => state.isDrawerCollapsed);
+  const k8sConfig = useAppSelector((state) => state.k8sConfig);
+  const capabilitiesRegistry = useAppSelector(
+    (state) => state.capabilitiesRegistry,
+  );
+  const meshSyncSubscription = useAppSelector(
+    (state) => state.meshSyncSubscription,
+  );
+  const mesheryControllerSubscription = useAppSelector(
+    (state) => state.mesheryControllerSubscription,
+  );
+  const connectionMetadata = useAppSelector(
+    (state) => state.connectionMetadata,
+  );
+  const telemetryURLs = useAppSelector((state) => state.telemetryURLs);
+  const operatorSubscription = useAppSelector(
+    (state) => state.operatorSubscription,
+  );
+  const toggleCatalogContent = useAppSelector((state) => state.toggleCatalogContent);
+
+  const meshsyncEventsSubscriptionRef = React.useRef({ current: null });
+  const eventsSubscriptionRef = React.useRef(null);
+
+  const [mobileOpen, setMobileOpen] = React.useState(false);
+  const [isFullScreenMode, setIsFullScreenMode] = React.useState(false);
+  const [k8sContexts, setK8sContexts] = React.useState<string[]>([]);
+  const [activeK8sContexts, setActiveK8sContexts] = React.useState([]);
+  const [disposeK8sContextSubscription, setDisposeK8sContextSubscription] =
+    React.useState(null);
+  const [theme, setTheme] = React.useState("light");
+  const [isOpen, setIsOpen] = React.useState(false);
+
+  const relayEnvironment = createRelayEnvironment();
+
+  const initSubscriptions = (contexts) => {
+    const newMesheryControllerSubscription = new GQLSubscription({
+      type: MESHERY_CONTROLLER_SUBSCRIPTION,
+      contextIds: contexts,
+      callbackFunction: (data) => {
+        dispatch({
+          type: actionTypes.SET_CONTROLLER_STATE,
+          controllerState: data,
+        });
+        console.log("CONTROLLER TEST CONTROLLER ", data);
+      },
+    });
+
+    dispatch(newMesheryControllerSubscription);
+  };
+
+  function initMeshSyncEventsSubscription(contexts = []) {
+    if (meshsyncEventsSubscriptionRef.current) {
+      meshsyncEventsSubscriptionRef.current.dispose();
+    }
+
+    const meshSyncEventsSubscription = subscribeMeshSyncEvents(
+      (result) => {
+        if (result.meshsyncevents.object.kind === "Service") {
+          const telemetryCompName = isTelemetryComponent(
+            result.meshsyncevents.object?.metadata?.name,
+          );
+          let prometheusURLs: string | any[] | Set<any> = [];
+          let grafanaURLs: any[] = [];
+
+          const grafanaUrlsSet = new Set(telemetryURLs.grafana);
+          const promUrlsSet = new Set(telemetryURLs.prometheus);
+
+          const eventType = result.meshsyncevents.type;
+          const spec = result?.meshsyncevents?.object?.spec?.attribute;
+          const status = result?.meshsyncevents?.object?.status?.attribute;
+          const data = { spec: JSON.parse(spec), status: JSON.parse(status) };
+
+          if (telemetryCompName === TelemetryComps.GRAFANA) {
+            grafanaURLs = grafanaURLs.concat(extractURLFromScanData(data));
+            updateURLs(grafanaUrlsSet, grafanaURLs, eventType);
+          } else if (telemetryCompName === TelemetryComps.PROMETHEUS) {
+            prometheusURLs = new Set(
+              prometheusURLs.concat(extractURLFromScanData(data)),
+            );
+            updateURLs(promUrlsSet, prometheusURLs, eventType);
+          }
+
+          updateTelemetryUrls({
+            telemetryURLs: {
+              grafana: Array.from(grafanaUrlsSet),
+              prometheus: Array.from(promUrlsSet),
+            },
+          });
+        }
+      },
+      {
+        k8scontextIDs: contexts,
+        eventTypes: ["ADDED", "DELETED"],
+      },
+    );
+
+    meshsyncEventsSubscriptionRef.current = meshSyncEventsSubscription;
+  }
+
+  const loadMeshModelComponent = async () => {
+    const version = "";
+    const apiVersion = "";
+
+    const newConnectionDef = {};
+
+    await Promise.all(
+      Object.keys(CONNECTION_KINDS).map(async (kind) => {
+        const connectionKind =
+          CONNECTION_KINDS[kind] === "meshery"
+            ? "meshery-core"
+            : CONNECTION_KINDS[kind];
+        const res = await getMeshModelComponent(
+          connectionKind,
+          "Connection",
+          version,
+          apiVersion,
+        );
+
+        if (res?.components) {
+          newConnectionDef[CONNECTION_KINDS[kind]] = {
+            transitions: res?.components[0].model.metadata.transitions,
+            icon: res?.components[0].metadata.svgColor,
+          };
+        }
+      }),
+    );
+
+    setConnectionMetadata(newConnectionDef);
+    setConnectionMetadata({
+      connectionMetadataState: newConnectionDef,
+    });
+  };
+
+  React.useEffect(() => {
+    const fetchData = async () => {
+      await loadConfigFromServer();
+      initSubscriptions([]);
+      try {
+        const result = await dataFetch("/api/user/prefs", {
+          method: "GET",
+          credentials: "include",
+        });
+        if (
+          typeof result?.usersExtensionPreferences?.catalogContent !==
+          "undefined"
+        ) {
+          dispatch(toggleCatalogContent({
+            catalogVisibility:
+              result?.usersExtensionPreferences?.catalogContent,
+          }));
+        }
+      } catch (err) {
+        console.error(err);
+      }
+      initMeshSyncEventsSubscription(activeK8sContexts);
+      loadMeshModelComponent();
+      handleDrawerToggle();
+      handleL5CommunityClick();
+    };
+
+    fetchData();
+
+    return () => {
+      document.removeEventListener("fullscreenchange", fullScreenChanged);
+    };
+  }, [activeK8sContexts, dispatch, initMeshSyncEventsSubscription, initSubscriptions, toggleCatalogContent]);
+
+  const router = useRouter();
+
+  const [prevK8sConfig, setPrevK8sConfig] = React.useState(null);
+
+  React.useEffect(() => {
+    // in case the meshery-ui is restricted, the user will be redirected to signup/extension page
+    if (isMesheryUiRestrictedAndThePageIsNotPlayground(capabilitiesRegistry)) {
+      router.push(mesheryExtensionRoute);
+    }
+
+    if (prevK8sConfig && !_.isEqual(prevK8sConfig, k8sConfig)) {
+      console.log(
+        "k8sconfig changed, re-initialising subscriptions",
+        k8sConfig,
+        activeK8sContexts,
+      );
+      const ids = getK8sConfigIdsFromK8sConfig(k8sConfig);
+      // if (operatorSubscription) {
+      //   operatorSubscription.updateSubscription(ids);
+      // }
+
+      if (mesheryControllerSubscription) {
+        mesheryControllerSubscription.updateSubscription(ids);
+      }
+      if (meshSyncSubscription) {
+        meshSyncSubscription.updateSubscription(ids);
+      }
+
+      if (meshsyncEventsSubscriptionRef.current) {
+        initMeshSyncEventsSubscription(ids);
+      }
+    }
+
+    setPrevK8sConfig(k8sConfig);
+  }, [k8sConfig]);
+
+  const fullScreenChanged = () => {
+    setIsFullScreenMode((prevIsFullScreenMode) => !prevIsFullScreenMode);
+  };
+
+  React.useEffect(
+    () => {
+      const fetchData = async () => {
+        try {
+          await loadConfigFromServer();
+          initSubscriptions([]);
+          const prefsResult = await dataFetch("/api/user/prefs", {
+            method: "GET",
+            credentials: "include",
+          });
+          if (
+            prefsResult?.usersExtensionPreferences?.catalogContent !== undefined
+          ) {
+            setToggleCatalogContent(
+              prefsResult.usersExtensionPreferences.catalogContent,
+            );
+          }
+
+          initMeshSyncEventsSubscription(activeK8sContexts);
+          const disposeK8sContextSubscription = k8sContextSubscription();
+          setDisposeK8sContextSubscription(disposeK8sContextSubscription);
+
+          document.addEventListener("fullscreenchange", fullScreenChanged);
+          loadMeshModelComponent();
+        } catch (error) {
+          console.error(error);
+        }
+      };
+
+      fetchData();
+    },
+    [
+      /* Add dependencies if needed */
+    ],
+  );
+
+  const loadConfigFromServer = async () => {
+    const { store } = props;
+    const result = await dataFetch("/api/system/sync", {
+      method: "GET",
+      credentials: "include",
+    });
+    if (result) {
+      if (
+        result.meshAdapters &&
+        result.meshAdapters !== null &&
+        result.meshAdapters.length > 0
+      ) {
+        store.dispatch({
+          type: actionTypes.UPDATE_ADAPTERS_INFO,
+          meshAdapters: result.meshAdapters,
+        });
+      }
+      // ... (rest of your update logic)
+
+      // Adjust other dispatch calls as needed
+    }
+  };
+
+  const k8sContextSubscription = (
+    page: string = "",
+    search: string = "",
+    pageSize: string = "10",
+    order: string = "",
+  ) => {
+    return subscribeK8sContext(
+      (result: K8sContextResult) => {
+        setK8sContexts(result.k8sContext.contexts);
+        dispatch({
+          type: actionTypes.UPDATE_CLUSTER_CONFIG,
+          k8sConfig: result.k8sContext.contexts,
+        });
+        setActiveContexts("all");
+      },
+      {
+        selector: {
+          page,
+          pageSize,
+          order,
+          search,
+        },
+      },
+    );
+  };
+
+  const handleDrawerToggle = () => {
+    setMobileOpen((prevMobileOpen) => !prevMobileOpen);
+  };
+
+  const handleL5CommunityClick = () => {
+    setIsOpen((prevIsOpen) => !prevIsOpen);
+  };
+
+  const activeContextChangeCallback = (activeK8sContexts) => {
+    if (activeK8sContexts.includes("all")) {
+      activeK8sContexts = ["all"];
+    }
+    dispatch({
+      type: actionTypes.SET_K8S_CONTEXT,
+      selectedK8sContexts: activeK8sContexts,
+    });
+  };
+
+  const setActiveContexts = (id) => {
+    if (k8sContexts?.contexts) {
+      if (id === "all") {
+        let activeContexts = [];
+        k8sContexts.contexts.forEach((ctx) => activeContexts.push(ctx.id));
+        activeContexts.push("all");
+        setActiveK8sContexts(activeContexts);
+        activeContextChangeCallback(activeContexts);
+        return;
+      }
+
+      setActiveK8sContexts((prevActiveContexts) => {
+        let ids = [...(prevActiveContexts || [])];
+
+        // pop event
+        if (ids.includes(id)) {
+          ids = ids.filter((cid) => cid !== id && cid !== "all");
+        } else {
+          // push event
+          if (ids.length === k8sContexts.contexts.length - 1) {
+            ids.push("all");
+          }
+          ids.push(id);
+        }
+
+        activeContextChangeCallback(ids);
+        return ids;
+      });
+    }
+  };
+
+  const searchContexts = async (search = "") => {
+    try {
+      const ctx = await fetchContexts(10, search);
+      setK8sContexts(ctx);
+
+      const active = ctx?.contexts?.find((c) => c.is_current_context === true);
+      if (active) {
+        setActiveK8sContexts([active?.id]);
+      }
+    } catch (err) {
+      console.error(err);
+    }
+  };
+
+  const updateExtensionType = (type) => {
+    dispatch({ type: actionTypes.UPDATE_EXTENSION_TYPE, extensionType: type });
+  };
+
+  // ... rest of the functions
+
+  return (
+    <Provider store={store}>
+      <Provider store={newStore()}>
+        <RelayEnvironmentProvider environment={relayEnvironment}>
+          <AppThemeProvider>
+            <RootLayout>
+              <Component {...props.pageProps} />
+            </RootLayout>
+          </AppThemeProvider>
+        </RelayEnvironmentProvider>
+      </Provider>
+    </Provider>
+  );
+}
+
+export default newStoreWrapper.withRedux(App);
+
+/** Helper functions */
+async function fetchContexts(number = 10, search = "") {
+  return await promisifiedDataFetch(
+    `/api/system/kubernetes/contexts?pagesize=${number}&search=${encodeURIComponent(
+      search,
+    )}`,
+  );
+}
+
+export const mesheryExtensionRoute = "/extension/meshmap";
+
+function isMesheryUiRestrictedAndThePageIsNotPlayground(
+  capabilitiesRegistry?: CapabilitiesRegistry,
+) {
+  return (
+    !window.location.pathname.startsWith(mesheryExtensionRoute) &&
+    capabilitiesRegistry?.restrictedAccess?.isMesheryUiRestricted
+  );
+}
+
+export function isExtensionOpen() {
+  return window.location.pathname.startsWith(mesheryExtensionRoute);
+}
